@@ -1,9 +1,17 @@
-from conan.tools.microsoft import is_msvc, msvc_runtime_flag
-from conans import ConanFile, tools
-from conans.errors import ConanInvalidConfiguration
 import os
+import shutil
 
-required_conan_version = ">=1.45.0"
+from conan import ConanFile, tools
+from conan.tools.apple import is_apple_os, XCRun
+from conan.tools.files import apply_conandata_patches, chdir, copy, export_conandata_patches, get
+from conan.tools.build.cpu import build_jobs
+from conan.tools.env import VirtualBuildEnv
+from conan.tools.layout import basic_layout
+from conan.tools.microsoft import is_msvc, msvc_runtime_flag, unix_path, VCVars
+from conan.tools.scm import Version
+from conan.errors import ConanInvalidConfiguration
+
+required_conan_version = ">=1.52.0"
 
 
 class BotanConan(ConanFile):
@@ -39,8 +47,8 @@ class BotanConan(ConanFile):
         "with_neon": [True, False],
         "with_armv8crypto": [True, False],
         "with_powercrypto": [True, False],
-        "enable_modules": "ANY",
-        "system_cert_bundle": "ANY",
+        "enable_modules": [None, "ANY"],
+        "system_cert_bundle": [None, "ANY"],
         "module_policy": [None, "bsi", "modern", "nist"],
     }
     default_options = {
@@ -84,14 +92,8 @@ class BotanConan(ConanFile):
     def _is_arm(self):
         return 'arm' in str(self.settings.arch)
 
-    @property
-    def _source_subfolder(self):
-        # Required to build at least 2.12.1
-        return "sources"
-
     def export_sources(self):
-        for patch in self.conan_data.get("patches", {}).get(self.version, []):
-            self.copy(patch["patch_file"])
+        export_conandata_patches(self)
 
     def config_options(self):
         if self.settings.os == 'Windows':
@@ -117,12 +119,15 @@ class BotanConan(ConanFile):
 
         # --single-amalgamation option is no longer available
         # See also https://github.com/randombit/botan/pull/2246
-        if tools.Version(self.version) >= '2.14.0':
+        if Version(self.version) >= '2.14.0':
             del self.options.single_amalgamation
 
     def configure(self):
         if self.options.shared:
             del self.options.fPIC
+
+    def layout(self):
+        basic_layout(self, src_folder="sources")
 
     def requirements(self):
         if self.options.with_bzip2:
@@ -147,10 +152,10 @@ class BotanConan(ConanFile):
                 raise ConanInvalidConfiguration('{0} requires non-header-only static boost, without magic_autolink, and with these components: {1}'.format(self.name, ', '.join(self._required_boost_components)))
 
         compiler = self.settings.compiler
-        version = tools.Version(self.settings.compiler.version)
+        version = Version(self.settings.compiler.version)
 
-        if compiler == 'Visual Studio' and version < '14':
-            raise ConanInvalidConfiguration("Botan doesn't support MSVC < 14")
+        if compiler == 'msvc' and version < '190':
+            raise ConanInvalidConfiguration("Botan doesn't support MSVC < 19.0")
 
         elif compiler == 'gcc' and version >= '5' and compiler.libcxx != 'libstdc++11':
             raise ConanInvalidConfiguration(
@@ -163,7 +168,7 @@ class BotanConan(ConanFile):
 
         # Some older compilers cannot handle the amalgamated build anymore
         # See also https://github.com/randombit/botan/issues/2328
-        if tools.Version(self.version) >= '2.14.0' and self.options.amalgamation:
+        if Version(self.version) >= '2.14.0' and self.options.amalgamation:
             if (compiler == 'apple-clang' and version < '10') or \
                (compiler == 'gcc' and version < '8') or \
                (compiler == 'clang' and version < '7'):
@@ -174,24 +179,28 @@ class BotanConan(ConanFile):
             raise ConanInvalidConfiguration("botan:single_amalgamation=True requires botan:amalgamation=True")
 
     def source(self):
-        tools.get(**self.conan_data['sources'][self.version], strip_root=True, destination=self._source_subfolder)
+        get(self, **self.conan_data['sources'][self.version], strip_root=True, destination=self.source_folder)
+        apply_conandata_patches(self)
+
+    def generate(self):
+        if is_msvc(self):
+            ms = VCVars(self)
+            ms.generate()
 
     def build(self):
-        for patch in self.conan_data.get('patches', {}).get(self.version, []):
-            tools.patch(**patch)
-        with tools.chdir(self._source_subfolder):
+        with chdir(self, self.source_folder):
             self.run(self._configure_cmd)
             self.run(self._make_cmd)
 
     def package(self):
-        self.copy(pattern='license.txt', dst='licenses', src=self._source_subfolder)
-        with tools.chdir(self._source_subfolder):
+        copy(self, "license.txt", src=self.source_folder, dst=os.path.join(self.package_folder, "licenses"))
+        with chdir(self, self.source_folder):
+            # Note: this will fail to properly consider the package_folder if a "conan build" followed by a "conan export-pkg" is executed
             self.run(self._make_install_cmd)
 
     def package_info(self):
-        major_version = tools.Version(self.version).major
+        major_version = Version(self.version).major
         self.cpp_info.set_property("pkg_config_name", f"botan-{major_version}")
-        self.cpp_info.names["pkg_config"] = f"botan-{major_version}"
         self.cpp_info.libs = ["botan" if is_msvc(self) else f"botan-{major_version}"]
         if self.settings.os == 'Linux':
             self.cpp_info.system_libs.extend(['dl', 'rt', 'pthread'])
@@ -259,8 +268,9 @@ class BotanConan(ConanFile):
         if self.options.get_safe('fPIC', True):
             botan_extra_cxx_flags.append('-fPIC')
 
-        if tools.is_apple_os(self.settings.os):
+        if is_apple_os(self):
             if self.settings.get_safe('os.version'):
+                # TODO: apple_deployment_target_flag() is currently private, is there a modern alternative?
                 # Required, see https://github.com/conan-io/conan-center-index/pull/3456
                 macos_min_version = tools.apple_deployment_target_flag(self.settings.os,
                                                                        self.settings.get_safe('os.version'),
@@ -268,14 +278,14 @@ class BotanConan(ConanFile):
                                                                        self.settings.get_safe('os.subsystem'),
                                                                        self.settings.get_safe('arch'))
                 botan_extra_cxx_flags.append(macos_min_version)
-            macos_sdk_path = '-isysroot {}'.format(tools.XCRun(self.settings).sdk_path)
+            macos_sdk_path = '-isysroot {}'.format(XCRun(self).sdk_path)
             botan_extra_cxx_flags.append(macos_sdk_path)
 
         # This is to work around botan's configure script that *replaces* its
         # standard (platform dependent) flags in presence of an environment
         # variable ${CXXFLAGS}. Most notably, this would build botan with
         # disabled compiler optimizations.
-        environment_cxxflags = tools.get_env('CXXFLAGS')
+        environment_cxxflags = os.getenv('CXXFLAGS')
         if environment_cxxflags:
             del os.environ['CXXFLAGS']
             botan_extra_cxx_flags.append(environment_cxxflags)
@@ -379,7 +389,7 @@ class BotanConan(ConanFile):
 
         call_python = 'python' if self.settings.os == 'Windows' else ''
 
-        prefix = tools.unix_path(self.package_folder) if self._is_mingw_windows else self.package_folder
+        prefix = unix_path(self.package_folder) if self._is_mingw_windows else self.package_folder
 
         botan_abi = ' '.join(botan_abi_flags) if botan_abi_flags else ' '
         botan_cxx_extras = ' '.join(botan_extra_cxx_flags) if botan_extra_cxx_flags else ' '
@@ -413,27 +423,24 @@ class BotanConan(ConanFile):
 
     @property
     def _make_program(self):
-        return tools.get_env('CONAN_MAKE_PROGRAM', tools.which('make') or tools.which('mingw32-make'))
+        return os.getenv('CONAN_MAKE_PROGRAM', shutil.which('make') or shutil.which('mingw32-make'))
 
     @property
     def _gnumake_cmd(self):
         make_ldflags = 'LDFLAGS=-lc++abi' if self._is_linux_clang_libcxx else ''
 
         make_cmd = ('{ldflags}' ' {make}' ' -j{cpucount}').format(
-                        ldflags=make_ldflags, make=self._make_program, cpucount=tools.cpu_count())
+                        ldflags=make_ldflags, make=self._make_program, cpucount=build_jobs())
         return make_cmd
 
     @property
     def _nmake_cmd(self):
-        vcvars = tools.vcvars_command(self.settings)
-        make_cmd = vcvars + ' && nmake'
-        return make_cmd
+        return 'nmake'
 
     @property
     def _make_install_cmd(self):
         if is_msvc(self):
-            vcvars = tools.vcvars_command(self.settings)
-            make_install_cmd = vcvars + ' && nmake install'
+            make_install_cmd = '{make} install'.format(make=self._nmake_cmd)
         else:
             make_install_cmd = '{make} install'.format(make=self._make_program)
         return make_install_cmd
